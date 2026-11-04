@@ -1,1 +1,1 @@
-from maubot_llm.bot import LlmBot
+from maubot_llm.bot import LlmBot as LlmBot
