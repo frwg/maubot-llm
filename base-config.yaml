@@ -1,19 +1,25 @@
-# Set allowlist to `false` to allow anyone; otherwise add entries such as "@user:example.com"
+# Restrict use to explicit Matrix IDs. Set to false only if open access is intended.
 allowlist: []
-default_backend: "local"
+# Bot administrators can change room-specific backend, model, prompt, and mode settings.
+admin_users: []
+default_backend: local
 backends:
   local:
     type: basic_openai
-    base_url: "http://localhost:1234"
-    authorization: null
+    base_url: http://127.0.0.1:1234
+    api_key: null
     default_model: null
-    default_system_prompt: "You are helpful digital assistant."
-  openai:
-    type: openai
-    api_key: YOUR_KEY_HERE
-    default_model: gpt-4-turbo
-  anthropic:
-    type: anthropic
-    api_key: YOUR_KEY_HERE
-    max_tokens: 1024
-    default_model: claude-3-opus-20240229
+    default_system_prompt: You are a helpful digital assistant.
+    # Optional: limit models selectable with !llm model.
+    models: []
+    timeout: 120
+    temperature: 0.7
+    max_tokens: 2048
+group_mode: mention
+# Matrix has no universal bot-account flag. Ignore known bot MXIDs explicitly.
+ignored_senders: []
+direct_rooms: []
+max_context_messages: 40
+context_ttl_seconds: 604800
+max_concurrent_requests: 4
+max_response_chars: 12000

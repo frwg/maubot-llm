@@ -1,34 +1,111 @@
-from maubot import Plugin
-from mautrix.util.config import BaseProxyConfig, ConfigUpdateHelper
-from maubot import Plugin, MessageEvent
+from __future__ import annotations
+
+import asyncio
+from typing import Any
+
+from maubot import MessageEvent, Plugin
 from maubot.handlers import command, event
-from mautrix.types import EventType, MessageEvent
-from typing import Type
-from maubot_llm.backends import Backend, BasicOpenAIBackend, OpenAIBackend, AnthropicBackend
-from maubot_llm import db
+from mautrix.errors import MatrixError
+from mautrix.types import EventType
 from mautrix.util.async_db import UpgradeTable
+from mautrix.util.config import BaseProxyConfig, ConfigUpdateHelper
+
+from maubot_llm import db
+from maubot_llm.backends import (
+    AnthropicBackend,
+    Backend,
+    BackendError,
+    BasicOpenAIBackend,
+    OpenAIBackend,
+)
 
 
 class Config(BaseProxyConfig):
     def do_update(self, helper: ConfigUpdateHelper) -> None:
-        helper.copy("allowlist")
-        helper.copy("default_backend")
-        helper.copy("backends")
+        for key in (
+            "allowlist",
+            "admin_users",
+            "default_backend",
+            "backends",
+            "group_mode",
+            "ignored_senders",
+            "direct_rooms",
+            "max_context_messages",
+            "context_ttl_seconds",
+            "max_concurrent_requests",
+            "max_response_chars",
+        ):
+            helper.copy(key)
 
 
 class LlmBot(Plugin):
     async def start(self) -> None:
         self.config.load_and_update()
-    
+        backends = self.config["backends"]
+        if not isinstance(backends, dict) or not backends:
+            raise ValueError("At least one LLM backend must be configured")
+        if self.config["default_backend"] not in backends:
+            raise ValueError("default_backend must reference a configured backend")
+        for key in backends:
+            room = db.Room()
+            room.backend = key
+            self.get_backend(room)
+        if self.config["group_mode"] not in {"mention", "all"}:
+            raise ValueError("group_mode must be 'mention' or 'all'")
+        int(self.config["max_context_messages"])
+        int(self.config["context_ttl_seconds"])
+        int(self.config["max_concurrent_requests"])
+        int(self.config["max_response_chars"])
+        self._request_semaphore = asyncio.Semaphore(
+            min(32, max(1, int(self.config["max_concurrent_requests"])))
+        )
+        self._context_locks = [asyncio.Lock() for _ in range(64)]
+        self._tasks: set[asyncio.Task[Any]] = set()
+
+    async def stop(self) -> None:
+        for task in self._tasks:
+            task.cancel()
+        if self._tasks:
+            await asyncio.gather(*self._tasks, return_exceptions=True)
+
     def is_allowed(self, sender: str) -> bool:
-        if self.config["allowlist"] == False:
+        allowlist = self.config["allowlist"]
+        return allowlist is False or sender in allowlist or self.is_admin(sender)
+
+    def is_admin(self, sender: str) -> bool:
+        return sender in self.config["admin_users"]
+
+    async def _can_manage_room(self, evt: MessageEvent) -> bool:
+        if self.is_admin(evt.sender):
             return True
-        return sender in self.config["allowlist"]
+        try:
+            power_levels = await self.client.get_state_event(
+                evt.room_id, EventType.ROOM_POWER_LEVELS
+            )
+        except MatrixError:
+            self.log.warning(
+                "Could not check room permissions for event in %s", evt.room_id
+            )
+            return False
+        user_levels = power_levels.get("users", {})
+        return (
+            int(user_levels.get(evt.sender, power_levels.get("users_default", 0))) >= 50
+        )
+
+    async def _require_room_admin(self, evt: MessageEvent) -> bool:
+        if await self._can_manage_room(evt):
+            return True
+        await evt.reply(
+            "This command is restricted to room or bot administrators.",
+            markdown=False,
+            allow_html=False,
+        )
+        return False
 
     @classmethod
-    def get_config_class(cls) -> Type[BaseProxyConfig]:
+    def get_config_class(cls) -> type[BaseProxyConfig]:
         return Config
-    
+
     async def get_room(self, room_id: str) -> db.Room:
         room = await db.fetch_room(self.database, room_id)
         if room is None:
@@ -36,138 +113,336 @@ class LlmBot(Plugin):
             room.room_id = room_id
             await db.upsert_room(self.database, room)
         return room
-    
+
     def get_backend(self, room: db.Room) -> Backend:
-        key = room.backend
-        if key is None:
-            key = self.config["default_backend"]
-        cfg = self.config["backends"][key]
-        cfg["key"] = key
-        if cfg["type"] == "basic_openai":
+        key = room.backend or self.config["default_backend"]
+        cfg = self.config["backends"].get(key)
+        if cfg is None:
+            raise BackendError("The configured backend is unavailable.")
+        backend_type = cfg.get("type")
+        if backend_type == "basic_openai":
             return BasicOpenAIBackend(cfg)
-        if cfg["type"] == "openai":
+        if backend_type == "openai":
             return OpenAIBackend(cfg)
-        if cfg["type"] == "anthropic":
+        if backend_type == "anthropic":
             return AnthropicBackend(cfg)
-        raise ValueError(f"unknown backend type {cfg['type']}")
-    
+        raise BackendError("The configured backend type is not supported.")
+
+    async def _is_direct_message(self, evt: MessageEvent) -> bool:
+        configured_rooms = self.config.get("direct_rooms", [])
+        if evt.room_id in configured_rooms:
+            return True
+        try:
+            members = await self.client.get_joined_members(evt.room_id)
+        except MatrixError:
+            self.log.warning("Could not determine whether room %s is a DM", evt.room_id)
+            return False
+        return len(members) <= 2
+
+    @staticmethod
+    def _thread_scope(evt: MessageEvent) -> str:
+        relates_to = getattr(evt.content, "relates_to", None)
+        if relates_to is not None:
+            relation_type = getattr(relates_to, "rel_type", None)
+            event_id = getattr(relates_to, "event_id", None)
+            if relation_type == "m.thread" and event_id:
+                return f"thread:{event_id}"
+        content = evt.content
+        if hasattr(content, "get"):
+            relation = content.get("m.relates_to", {})
+            if isinstance(relation, dict) and relation.get("rel_type") == "m.thread":
+                event_id = relation.get("event_id")
+                if event_id:
+                    return f"thread:{event_id}"
+        return ""
+
+    async def _context_scope(self, evt: MessageEvent, is_dm: bool) -> str:
+        thread_scope = self._thread_scope(evt)
+        if is_dm:
+            return (
+                f"dm:{evt.sender}:{thread_scope}"
+                if thread_scope
+                else f"dm:{evt.sender}"
+            )
+        return thread_scope
+
+    def _is_mentioned(self, evt: MessageEvent) -> bool:
+        content = evt.content
+        bot_mxid = getattr(self.client, "mxid", "")
+        mentions = getattr(content, "mentions", None)
+        if mentions and bot_mxid in getattr(mentions, "user_ids", []):
+            return True
+        if hasattr(content, "get"):
+            mentions = content.get("m.mentions", {})
+            if isinstance(mentions, dict) and bot_mxid in mentions.get("user_ids", []):
+                return True
+        return bool(bot_mxid and bot_mxid in content.body)
+
+    @staticmethod
+    def _is_edit(evt: MessageEvent) -> bool:
+        content = evt.content
+        relates_to = getattr(content, "relates_to", None)
+        if getattr(relates_to, "rel_type", None) == "m.replace":
+            return True
+        if hasattr(content, "get"):
+            relation = content.get("m.relates_to", {})
+            return (
+                isinstance(relation, dict) and relation.get("rel_type") == "m.replace"
+            )
+        return False
+
+    def _track_task(self, task: asyncio.Task[Any]) -> None:
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+        task.add_done_callback(self._log_task_error)
+
+    def _log_task_error(self, task: asyncio.Task[Any]) -> None:
+        if not task.cancelled() and (error := task.exception()) is not None:
+            self.log.error(
+                "Background message task failed",
+                exc_info=(type(error), error, error.__traceback__),
+            )
+
     @command.new(name="llm", require_subcommand=True)
     async def llm_command(self, evt: MessageEvent) -> None:
         pass
 
-    @llm_command.subcommand(help="Display configuration used for current room.")
+    @llm_command.subcommand(help="Display the active configuration without secrets.")
     async def info(self, evt: MessageEvent) -> None:
         if not self.is_allowed(evt.sender):
-            self.log.warn(f"stranger danger: sender={evt.sender}")
             return
         room = await self.get_room(evt.room_id)
-        context = await db.fetch_context(self.database, room.room_id)
+        backend_key = room.backend or self.config["default_backend"]
         backend = self.get_backend(room)
-        all_backends = ", ".join(self.config["backends"].keys())
+        model = room.model or backend.default_model or "not specified"
+        prompt = room.system_prompt or backend.default_system_prompt or "not specified"
+        scope_id = await self._context_scope(
+            evt, is_dm=await self._is_direct_message(evt)
+        )
+        context = await db.fetch_context(
+            self.database,
+            room.room_id,
+            scope_id,
+            max_messages=min(500, max(2, int(self.config["max_context_messages"]))),
+            ttl_seconds=int(self.config["context_ttl_seconds"]),
+        )
+        response = (
+            f"Backend: {backend_key}\n"
+            f"Model: {model}\n"
+            f"System prompt: {prompt}\n"
+            f"Room mode: {room.mode or self.config['group_mode']}\n"
+            f"Context messages: {len(context)}"
+        )
+        await evt.reply(response, markdown=False, allow_html=False)
 
-        all_models = "unknown"
-        try:
-            all_models = ", ".join(await backend.fetch_models(self.http))
-        except:
-            pass
-
-        items = []
-        items.append(f"- Backend: {backend.cfg['key']} (available: {all_backends})")
-        if room.model:
-            items.append(f"- Model: {room.model}")
-        elif backend.default_model:
-            items.append(f"- Model (backend default): {backend.default_model}")
-        else:
-            items.append("- Model not specified")
-        items[-1] += f" (available: {all_models})"
-        if room.system_prompt:
-            items.append(f"- System Prompt: {room.system_prompt}")
-        elif backend.default_system_prompt:
-            items.append(f"- System Prompt (backend default): {backend.default_system_prompt}")
-        else:
-            items.append("- System Prompt not specified")
-        items.append(f"- Context Message Count: {len(context)}")
-        msg = "\n".join(items)
-        await evt.reply(msg)
-    
-    @llm_command.subcommand(help="Switch to a different backend for this room.")
+    @llm_command.subcommand(
+        help="Switch this room to a configured backend (room or bot admins only)."
+    )
     @command.argument("key")
     async def backend(self, evt: MessageEvent, key: str) -> None:
-        if not self.is_allowed(evt.sender):
-            self.log.warn(f"stranger danger: sender={evt.sender}")
+        if not await self._require_room_admin(evt):
             return
-        if key not in self.config["backends"].keys():
-            all_backends = ", ".join(self.config["backends"].keys())
-            msg = f"Invalid backend. Available backends: {all_backends}"
-            await evt.reply(msg)
+        if key not in self.config["backends"]:
+            await evt.reply("Unknown backend key.", markdown=False, allow_html=False)
             return
         room = await self.get_room(evt.room_id)
         room.backend = key
-        await db.upsert_room(self.database, room)
-        await evt.react("✅")
-    
-    @llm_command.subcommand(help="Switch to a different model for this room. Use '-' to switch to the backend's default model.")
-    @command.argument("model")
-    async def model(self, evt: MessageEvent, model: str) -> None:
-        if not self.is_allowed(evt.sender):
-            self.log.warn(f"stranger danger: sender={evt.sender}")
-            return
-        # TODO validate model when the backend supports it
-        room = await self.get_room(evt.room_id)
-        if model == "-":
-            room.model = None
-        else:
-            room.model = model
-        await db.upsert_room(self.database, room)
-        await evt.react("✅")
-    
-    @llm_command.subcommand(help="Switch to a different system prompt for this room. Use '-' to switch to the backend's default system prompt.")
-    @command.argument("prompt", pass_raw=True)
-    async def system(self, evt: MessageEvent, prompt: str) -> None:
-        if not self.is_allowed(evt.sender):
-            self.log.warn(f"stranger danger: sender={evt.sender}")
-            return
-        # TODO validate model when the backend supports it
-        room = await self.get_room(evt.room_id)
-        if prompt == "-":
-            room.system_prompt = None
-        else:
-            room.system_prompt = prompt
+        room.model = None
         await db.upsert_room(self.database, room)
         await evt.react("✅")
 
-    @llm_command.subcommand(help="Forget all context and treat subsequent messages as part of a new chat with the LLM.")
+    @llm_command.subcommand(
+        help="Set the model for this room (room or bot admins only); use '-' for default."
+    )
+    @command.argument("model")
+    async def model(self, evt: MessageEvent, model: str) -> None:
+        if not await self._require_room_admin(evt):
+            return
+        room = await self.get_room(evt.room_id)
+        backend = self.get_backend(room)
+        if model != "-":
+            allowed_models = backend.cfg.get("models", [])
+            if not allowed_models:
+                try:
+                    allowed_models = await backend.fetch_models(self.http)
+                except BackendError as err:
+                    await evt.reply(str(err), markdown=False, allow_html=False)
+                    return
+            if model not in allowed_models:
+                await evt.reply(
+                    "That model is not in the backend's approved model list.",
+                    markdown=False,
+                    allow_html=False,
+                )
+                return
+        room.model = None if model == "-" else model
+        await db.upsert_room(self.database, room)
+        await evt.react("✅")
+
+    @llm_command.subcommand(
+        help="Set this room's system prompt (room or bot admins only); use '-' for default."
+    )
+    @command.argument("prompt", pass_raw=True)
+    async def system(self, evt: MessageEvent, prompt: str) -> None:
+        if not await self._require_room_admin(evt):
+            return
+        room = await self.get_room(evt.room_id)
+        room.system_prompt = None if prompt == "-" else prompt
+        await db.upsert_room(self.database, room)
+        await evt.react("✅")
+
+    @llm_command.subcommand(
+        help="Set the room mode: mention or all (room or bot admins only)."
+    )
+    @command.argument("mode")
+    async def mode(self, evt: MessageEvent, mode: str) -> None:
+        if not await self._require_room_admin(evt):
+            return
+        if mode not in {"mention", "all"}:
+            await evt.reply("Mode must be 'mention' or 'all'.")
+            return
+        room = await self.get_room(evt.room_id)
+        room.mode = mode
+        await db.upsert_room(self.database, room)
+        await evt.react("✅")
+
+    @llm_command.subcommand(
+        help="Clear your DM context; room-wide context requires an administrator."
+    )
     async def clear(self, evt: MessageEvent) -> None:
         if not self.is_allowed(evt.sender):
-            self.log.warn(f"stranger danger: sender={evt.sender}")
+            return
+        if await self._is_direct_message(evt):
+            scope_id = await self._context_scope(evt, is_dm=True)
+            await db.clear_context(self.database, evt.room_id, scope_id)
+            await evt.react("✅")
+        elif await self._can_manage_room(evt):
+            await db.clear_context(self.database, evt.room_id, self._thread_scope(evt))
+            await evt.react("✅")
+        else:
+            await evt.reply(
+                "Room context is shared. Ask a bot administrator to clear it.",
+                markdown=False,
+                allow_html=False,
+            )
+
+    @llm_command.subcommand(
+        help="Clear all context in this room (room or bot admins only)."
+    )
+    async def clear_room(self, evt: MessageEvent) -> None:
+        if not await self._require_room_admin(evt):
             return
         await db.clear_context(self.database, evt.room_id)
         await evt.react("✅")
 
     @event.on(EventType.ROOM_MESSAGE)
     async def handle_msg(self, evt: MessageEvent) -> None:
+        content = evt.content
+        body = getattr(content, "body", "")
+        if (
+            evt.sender == getattr(self.client, "mxid", None)
+            or not isinstance(body, str)
+            or not body.strip()
+            or getattr(content, "msgtype", None) not in {"m.text", "m.notice"}
+            or self._is_edit(evt)
+            or body.startswith("!")
+        ):
+            return
+        if evt.sender in self.config["ignored_senders"]:
+            return
         if not self.is_allowed(evt.sender):
-            self.log.warn(f"stranger danger: sender={evt.sender}")
             return
-        if evt.content.body.startswith("!"):
-            return
+
+        direct = await self._is_direct_message(evt)
         room = await self.get_room(evt.room_id)
-        await db.append_context(self.database, room.room_id, "user", evt.content.body)
+        if not direct:
+            mode = room.mode or self.config["group_mode"]
+            if mode != "all" and not self._is_mentioned(evt):
+                return
+        if not await db.claim_event(self.database, evt.event_id):
+            return
+        await db.prune_expired_contexts(
+            self.database, int(self.config["context_ttl_seconds"])
+        )
         await evt.mark_read()
-        # TODO: refresh the typing indicator if generation takes longer
-        # (or, alternatively, set a timeout for generation)
-        await self.client.set_typing(evt.room_id, 30000)
-        try:
-            backend = self.get_backend(room)
-            model = room.model or backend.default_model
-            system = room.system_prompt or backend.default_system_prompt
-            context = await db.fetch_context(self.database, room.room_id)
-            completion = await backend.create_chat_completion(self.http, context=context, system=system, model=model)
-            await db.append_context(self.database, room.room_id, completion.message["role"], completion.message["content"])
-            await evt.respond(completion.message["content"])
-        finally:
-            await self.client.set_typing(evt.room_id, 0)
-    
+        scope_id = await self._context_scope(evt, direct)
+        task = asyncio.create_task(self._generate_reply(evt, room, scope_id, body))
+        self._track_task(task)
+
+    async def _generate_reply(
+        self, evt: MessageEvent, room: db.Room, scope_id: str, body: str
+    ) -> None:
+        lock_index = hash((evt.room_id, scope_id)) % len(self._context_locks)
+        lock = self._context_locks[lock_index]
+        async with lock:
+            try:
+                await self.client.set_typing(evt.room_id, 30000)
+                limit = min(500, max(2, int(self.config["max_context_messages"])))
+                await db.append_context(
+                    self.database,
+                    room.room_id,
+                    "user",
+                    body,
+                    scope_id=scope_id,
+                    max_messages=limit,
+                )
+                context = await db.fetch_context(
+                    self.database,
+                    room.room_id,
+                    scope_id=scope_id,
+                    max_messages=limit,
+                    ttl_seconds=int(self.config["context_ttl_seconds"]),
+                )
+                backend = self.get_backend(room)
+                async with self._request_semaphore:
+                    completion = await backend.create_chat_completion(
+                        self.http,
+                        context=context,
+                        system=room.system_prompt or backend.default_system_prompt,
+                        model=room.model or backend.default_model,
+                    )
+                answer = completion.message["content"].strip()
+                await db.append_context(
+                    self.database,
+                    room.room_id,
+                    "assistant",
+                    answer,
+                    scope_id=scope_id,
+                    max_messages=limit,
+                )
+                max_chars = min(
+                    50000, max(1000, int(self.config["max_response_chars"]))
+                )
+                remaining = answer
+                while remaining:
+                    split_at = max_chars
+                    if len(remaining) > max_chars:
+                        newline = remaining.rfind("\n", 0, max_chars)
+                        if newline >= max_chars // 2:
+                            split_at = newline
+                    await evt.reply(
+                        remaining[:split_at],
+                        markdown=True,
+                        allow_html=False,
+                    )
+                    remaining = remaining[split_at:].lstrip("\n")
+            except BackendError as err:
+                await evt.reply(str(err), markdown=False, allow_html=False)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                self.log.exception("Failed to process an LLM request")
+                await evt.reply(
+                    "I couldn't complete that request. Please try again later.",
+                    markdown=False,
+                    allow_html=False,
+                )
+            finally:
+                try:
+                    await self.client.set_typing(evt.room_id, 0)
+                except MatrixError:
+                    self.log.warning("Could not clear the typing indicator")
+
     @classmethod
     def get_db_upgrade_table(cls) -> UpgradeTable | None:
         return db.upgrade_table
