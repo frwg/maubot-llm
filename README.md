@@ -63,12 +63,13 @@ Beim Typ `openai` ist `base_url` optional und standardmäßig `https://api.opena
 
 - `allowlist: []` sperrt die Nutzung für alle normalen Benutzer. Nur explizit eingetragene Matrix-IDs dürfen chatten. `allowlist: false` öffnet den Bot für alle; dies nur bewusst aktivieren.
 - `admin_users` bestimmt globale Bot-Administratoren. Zusätzlich können Matrix-Raummitglieder mit Power-Level mindestens 50 die raumbezogenen Einstellungen verwalten.
-- Gruppenräume reagieren standardmäßig auf eine Matrix-Erwähnung des Bots oder den Befehl `!llm`. `!llm mode all` aktiviert Antworten auf alle Textnachrichten des Raums; `!llm mode mention` setzt den Standard zurück. Direktnachrichten werden anhand der Mitgliedschaft erkannt; bei abweichenden Raumkonstellationen können Raum-IDs unter `direct_rooms` eingetragen werden.
+- Gruppenräume reagieren standardmäßig auf eine Matrix-Erwähnung des Bots oder den Befehl `!llm`. `!llm mode all` antwortet auf alle Textnachrichten; `!llm mode intent` lässt das interne LLM jede Gruppennachricht anhand des bisherigen Kontexts klassifizieren. Explizite Erwähnungen lösen immer eine Antwort aus; sonst antwortet der Bot nur bei vermuteter Ansprache. Bei einem Klassifikationsfehler antwortet er ohne explizite Erwähnung nicht. Im Modus `intent` werden auch nicht adressierte Nachrichten im gemeinsamen Raum-/Thread-Kontext gespeichert, aber nicht beantwortet. Direktnachrichten erhalten immer eine Antwort. Bei abweichenden Raumkonstellationen können Raum-IDs unter `direct_rooms` eingetragen werden.
+- Die Intent-Diagnosemeldungen erscheinen in den Maubot-Containerlogs. Sie protokollieren feste Verarbeitungsentscheidungen und Backendfehler, aber keine Nachrichteninhalte oder MXIDs.
 - Matrix stellt kein universelles Kennzeichen für Bot-Konten bereit. Andere Bots können über ihre MXIDs unter `ignored_senders` explizit ausgeschlossen werden.
 - `!llm info`: aktive Backend-/Modell-/Prompt-/Modus-Einstellungen anzeigen (keine API-Schlüssel).
 - `!llm clear`: eigenen Kontext in einer Direktnachricht löschen. In einem Gruppenraum können nur Raum- oder Bot-Administratoren den aktuellen Kontext löschen.
 - `!llm clear-room`: sämtliche Kontexte des Raums löschen (Raum- oder Bot-Administratoren).
-- `!llm backend KEY`, `!llm model NAME`, `!llm system TEXT` und `!llm mode mention|all`: raumbezogene Einstellungen ändern. Ein Modell muss unter `models` freigegeben oder über die Backend-Modellerkennung verfügbar sein.
+- `!llm backend KEY`, `!llm model NAME`, `!llm system TEXT` und `!llm mode mention|all|intent`: raumbezogene Einstellungen ändern. Im Modus `intent` wird jede Gruppennachricht an das konfigurierte interne LLM zur Klassifizierung gesendet; eine explizite oder vermutete Ansprache löst einen weiteren Aufruf für die Antwort aus. Ein Modell muss unter `models` freigegeben oder über die Backend-Modellerkennung verfügbar sein.
 
 Kontexte in Gruppenräumen sind innerhalb eines Raums bzw. Threads gemeinsam. Administratoren sollten keine Nutzer mit unterschiedlichen Berechtigungs- oder Vertraulichkeitsstufen in denselben Chat-Kontext aufnehmen. Direktnachrichten sind zusätzlich nach Absender getrennt.
 

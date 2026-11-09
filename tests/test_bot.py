@@ -7,7 +7,7 @@ import pytest
 from mautrix.types import EventType, MessageType
 from ruamel.yaml import YAML
 
-from maubot_llm.backends import ChatCompletion
+from maubot_llm.backends import BackendError, ChatCompletion
 from maubot_llm.bot import LlmBot, _validate_id_list
 from maubot_llm.db import Room
 
@@ -211,6 +211,202 @@ async def test_message_filters_and_duplicate_event():
     ) as claim:
         await bot.handle_msg(all_mode_event)
         claim.assert_awaited_once_with(bot.database, all_mode_event.event_id)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("response", "expected"),
+    [("YES", True), (" yes. ", True), ("NO", False)],
+)
+async def test_group_intent_classifier_parses_verdict(response, expected):
+    bot = make_bot()
+    bot._request_semaphore = asyncio.Semaphore(1)
+    bot.http = object()
+    backend = Mock()
+    backend.create_chat_completion = AsyncMock(
+        return_value=ChatCompletion({"content": response}, "stop", "mock")
+    )
+    bot.get_backend = Mock(return_value=backend)
+    room = Room()
+    context = [{"role": "user", "content": "Could the bot help?"}]
+
+    assert await bot._classify_group_message(room, context) is expected
+    backend.create_chat_completion.assert_awaited_once()
+    assert backend.create_chat_completion.await_args.kwargs["context"] == context
+
+
+@pytest.mark.asyncio
+async def test_group_intent_classifier_rejects_ambiguous_verdict():
+    bot = make_bot()
+    bot._request_semaphore = asyncio.Semaphore(1)
+    bot.http = object()
+    backend = Mock()
+    backend.create_chat_completion = AsyncMock(
+        return_value=ChatCompletion({"content": "Probably yes"}, "stop", "mock")
+    )
+    bot.get_backend = Mock(return_value=backend)
+
+    with pytest.raises(BackendError, match="invalid decision"):
+        await bot._classify_group_message(Room(), [])
+
+
+@pytest.mark.asyncio
+async def test_intent_mode_stores_unaddressed_message_without_reply():
+    bot = make_bot()
+    bot.config.update(
+        ignored_senders=[],
+        group_mode="intent",
+        direct_rooms=[],
+        max_context_messages=40,
+        context_ttl_seconds=604800,
+    )
+    bot.log = Mock()
+    bot._context_locks = [asyncio.Lock() for _ in range(64)]
+    bot.database = object()
+    bot.client.set_typing = AsyncMock()
+    bot._is_direct_message = AsyncMock(return_value=False)
+    bot._is_mentioned = Mock(return_value=False)
+    room = Room()
+    room.room_id = "!room:example.org"
+    bot.get_room = AsyncMock(return_value=room)
+    context = [{"role": "user", "content": "A message not for the bot"}]
+    bot._classify_group_message = AsyncMock(return_value=False)
+    evt = SimpleNamespace(
+        sender="@alice:example.org",
+        room_id=room.room_id,
+        event_id="$intent-event",
+        content=Content(
+            {
+                "body": "A message not for the bot",
+                "msgtype": MessageType.TEXT,
+            }
+        ),
+        mark_read=AsyncMock(),
+        reply=AsyncMock(),
+    )
+    tasks = []
+    bot._track_task = tasks.append
+
+    with (
+        patch(
+            "maubot_llm.bot.db.claim_event",
+            new_callable=AsyncMock,
+            return_value=True,
+        ),
+        patch("maubot_llm.bot.db.prune_expired_contexts", new_callable=AsyncMock),
+        patch(
+            "maubot_llm.bot.db.append_context", new_callable=AsyncMock
+        ) as append_context,
+        patch(
+            "maubot_llm.bot.db.fetch_context",
+            new_callable=AsyncMock,
+            return_value=context,
+        ),
+    ):
+        await bot.handle_msg(evt)
+        await asyncio.gather(*tasks)
+
+    append_context.assert_awaited_once_with(
+        bot.database,
+        room.room_id,
+        "user",
+        "A message not for the bot",
+        scope_id="",
+        max_messages=40,
+    )
+    bot._classify_group_message.assert_awaited_once_with(room, context)
+    evt.mark_read.assert_awaited_once()
+    evt.reply.assert_not_awaited()
+    bot.client.set_typing.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mentioned", [False, True])
+async def test_intent_mode_replies_to_classified_or_mentioned_message(mentioned):
+    bot = make_bot()
+    bot.config.update(
+        ignored_senders=[],
+        group_mode="intent",
+        direct_rooms=[],
+        max_context_messages=40,
+        context_ttl_seconds=604800,
+        max_response_chars=12000,
+    )
+    bot.log = Mock()
+    bot._context_locks = [asyncio.Lock() for _ in range(64)]
+    bot._request_semaphore = asyncio.Semaphore(1)
+    bot.database = object()
+    bot.http = object()
+    bot.client.set_typing = AsyncMock()
+    bot._is_direct_message = AsyncMock(return_value=False)
+    room = Room()
+    room.room_id = "!room:example.org"
+    bot.get_room = AsyncMock(return_value=room)
+    bot._classify_group_message = AsyncMock(return_value=not mentioned)
+    backend = Mock()
+    backend.default_system_prompt = "default system"
+    backend.default_model = "mock"
+    backend.create_chat_completion = AsyncMock(
+        return_value=ChatCompletion(
+            {"content": "Answer to the latest question"}, "stop", "mock"
+        )
+    )
+    bot.get_backend = Mock(return_value=backend)
+    context = [
+        {"role": "user", "content": "Earlier question"},
+        {"role": "assistant", "content": "Earlier answer"},
+        {"role": "user", "content": "What about this latest question?"},
+    ]
+    content = {
+        "body": "What about this latest question?",
+        "msgtype": MessageType.TEXT,
+    }
+    if mentioned:
+        content["m.mentions"] = {"user_ids": [bot.client.mxid]}
+    evt = SimpleNamespace(
+        sender="@alice:example.org",
+        room_id=room.room_id,
+        event_id="$intent-reply-event",
+        content=Content(content),
+        mark_read=AsyncMock(),
+        reply=AsyncMock(),
+    )
+    tasks = []
+    bot._track_task = tasks.append
+
+    with (
+        patch(
+            "maubot_llm.bot.db.claim_event",
+            new_callable=AsyncMock,
+            return_value=True,
+        ),
+        patch("maubot_llm.bot.db.prune_expired_contexts", new_callable=AsyncMock),
+        patch(
+            "maubot_llm.bot.db.append_context", new_callable=AsyncMock
+        ) as append_context,
+        patch(
+            "maubot_llm.bot.db.fetch_context",
+            new_callable=AsyncMock,
+            return_value=context,
+        ),
+    ):
+        await bot.handle_msg(evt)
+        await asyncio.gather(*tasks)
+
+    bot._classify_group_message.assert_awaited_once_with(room, context)
+    assert append_context.await_count == 2
+    assert append_context.await_args_list[0].args[2:4] == (
+        "user",
+        "What about this latest question?",
+    )
+    assert append_context.await_args_list[1].args[2:4] == (
+        "assistant",
+        "Answer to the latest question",
+    )
+    backend.create_chat_completion.assert_awaited_once()
+    assert backend.create_chat_completion.await_args.kwargs["context"] == context
+    evt.reply.assert_awaited_once()
+    assert evt.reply.await_args.args[0] == "Answer to the latest question"
 
 
 @pytest.mark.asyncio
