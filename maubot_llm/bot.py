@@ -38,9 +38,20 @@ class Config(BaseProxyConfig):
             helper.copy(key)
 
 
+def _validate_id_list(name: str, value: Any, *, allow_false: bool = False) -> None:
+    if allow_false and value is False:
+        return
+    if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
+        expected = "false or a list" if allow_false else "a list"
+        raise ValueError(f"{name} must be {expected} of Matrix IDs")
+
+
 class LlmBot(Plugin):
     async def start(self) -> None:
         self.config.load_and_update()
+        _validate_id_list("allowlist", self.config["allowlist"], allow_false=True)
+        _validate_id_list("admin_users", self.config["admin_users"])
+        _validate_id_list("ignored_senders", self.config["ignored_senders"])
         backends = self.config["backends"]
         if not isinstance(backends, dict) or not backends:
             raise ValueError("At least one LLM backend must be configured")
@@ -339,18 +350,26 @@ class LlmBot(Plugin):
     async def handle_msg(self, evt: MessageEvent) -> None:
         content = evt.content
         body = getattr(content, "body", "")
-        if (
-            evt.sender == getattr(self.client, "mxid", None)
-            or not isinstance(body, str)
-            or not body.strip()
-            or getattr(content, "msgtype", None) not in {"m.text", "m.notice"}
-            or self._is_edit(evt)
-            or body.startswith("!")
-        ):
+        if evt.sender == getattr(self.client, "mxid", None):
+            self.log.debug("Ignoring self-sent message")
+            return
+        if not isinstance(body, str) or not body.strip():
+            self.log.debug("Ignoring empty or non-text message")
+            return
+        if getattr(content, "msgtype", None) not in {"m.text", "m.notice"}:
+            self.log.debug("Ignoring unsupported message type")
+            return
+        if self._is_edit(evt):
+            self.log.debug("Ignoring message edit")
+            return
+        if body.startswith("!"):
+            self.log.debug("Ignoring command in message handler")
             return
         if evt.sender in self.config["ignored_senders"]:
+            self.log.debug("Ignoring configured sender")
             return
         if not self.is_allowed(evt.sender):
+            self.log.debug("Ignoring sender not in allowlist")
             return
 
         direct = await self._is_direct_message(evt)
@@ -358,14 +377,17 @@ class LlmBot(Plugin):
         if not direct:
             mode = room.mode or self.config["group_mode"]
             if mode != "all" and not self._is_mentioned(evt):
+                self.log.debug("Ignoring unmentioned group message")
                 return
         if not await db.claim_event(self.database, evt.event_id):
+            self.log.debug("Ignoring duplicate event")
             return
         await db.prune_expired_contexts(
             self.database, int(self.config["context_ttl_seconds"])
         )
         await evt.mark_read()
         scope_id = await self._context_scope(evt, direct)
+        self.log.debug("Accepted message; scheduling LLM response")
         task = asyncio.create_task(self._generate_reply(evt, room, scope_id, body))
         self._track_task(task)
 

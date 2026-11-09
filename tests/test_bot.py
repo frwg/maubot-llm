@@ -8,7 +8,7 @@ from mautrix.types import EventType
 from ruamel.yaml import YAML
 
 from maubot_llm.backends import ChatCompletion
-from maubot_llm.bot import LlmBot
+from maubot_llm.bot import LlmBot, _validate_id_list
 from maubot_llm.db import Room
 
 
@@ -48,6 +48,26 @@ def test_allowlist_and_plugin_metadata():
     assert config["default_backend"] in config["backends"]
     assert config["allowlist"] == []
     assert LlmBot.get_config_class().__name__ == "Config"
+
+
+@pytest.mark.parametrize(
+    ("name", "value", "allow_false", "valid"),
+    [
+        ("allowlist", [], True, True),
+        ("allowlist", ["@alice:example.org"], True, True),
+        ("allowlist", False, True, True),
+        ("allowlist", None, True, False),
+        ("allowlist", [None], True, False),
+        ("admin_users", False, False, False),
+        ("ignored_senders", ["@bot:example.org"], False, True),
+    ],
+)
+def test_validate_id_list(name, value, allow_false, valid):
+    if valid:
+        _validate_id_list(name, value, allow_false=allow_false)
+    else:
+        with pytest.raises(ValueError, match=name):
+            _validate_id_list(name, value, allow_false=allow_false)
 
 
 def test_mentions_edits_and_thread_scopes():
