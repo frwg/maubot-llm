@@ -233,6 +233,9 @@ async def test_group_intent_classifier_parses_verdict(response, expected):
     assert await bot._classify_group_message(room, context) is expected
     backend.create_chat_completion.assert_awaited_once()
     assert backend.create_chat_completion.await_args.kwargs["context"] == context
+    classifier_prompt = backend.create_chat_completion.await_args.kwargs["system"]
+    assert "asks Whereminator not to answer" in classifier_prompt
+    assert "explicit mention alone is not enough" in classifier_prompt
 
 
 @pytest.mark.asyncio
@@ -251,7 +254,14 @@ async def test_group_intent_classifier_rejects_ambiguous_verdict():
 
 
 @pytest.mark.asyncio
-async def test_intent_mode_stores_unaddressed_message_without_reply():
+@pytest.mark.parametrize(
+    ("body", "mentioned"),
+    [
+        ("A message not for the bot", False),
+        ("Whereminator, bitte antworte nicht auf diese Nachricht", True),
+    ],
+)
+async def test_intent_mode_stores_messages_without_expected_reply(body, mentioned):
     bot = make_bot()
     bot.config.update(
         ignored_senders=[],
@@ -265,11 +275,11 @@ async def test_intent_mode_stores_unaddressed_message_without_reply():
     bot.database = object()
     bot.client.set_typing = AsyncMock()
     bot._is_direct_message = AsyncMock(return_value=False)
-    bot._is_mentioned = Mock(return_value=False)
+    bot._is_mentioned = Mock(return_value=mentioned)
     room = Room()
     room.room_id = "!room:example.org"
     bot.get_room = AsyncMock(return_value=room)
-    context = [{"role": "user", "content": "A message not for the bot"}]
+    context = [{"role": "user", "content": body}]
     bot._classify_group_message = AsyncMock(return_value=False)
     evt = SimpleNamespace(
         sender="@alice:example.org",
@@ -277,7 +287,7 @@ async def test_intent_mode_stores_unaddressed_message_without_reply():
         event_id="$intent-event",
         content=Content(
             {
-                "body": "A message not for the bot",
+                "body": body,
                 "msgtype": MessageType.TEXT,
             }
         ),
@@ -310,7 +320,7 @@ async def test_intent_mode_stores_unaddressed_message_without_reply():
         bot.database,
         room.room_id,
         "user",
-        "A message not for the bot",
+        body,
         scope_id="",
         max_messages=40,
     )
@@ -322,7 +332,7 @@ async def test_intent_mode_stores_unaddressed_message_without_reply():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("mentioned", [False, True])
-async def test_intent_mode_replies_to_classified_or_mentioned_message(mentioned):
+async def test_intent_mode_replies_when_classifier_accepts(mentioned):
     bot = make_bot()
     bot.config.update(
         ignored_senders=[],
@@ -342,7 +352,7 @@ async def test_intent_mode_replies_to_classified_or_mentioned_message(mentioned)
     room = Room()
     room.room_id = "!room:example.org"
     bot.get_room = AsyncMock(return_value=room)
-    bot._classify_group_message = AsyncMock(return_value=not mentioned)
+    bot._classify_group_message = AsyncMock(return_value=True)
     backend = Mock()
     backend.default_system_prompt = "default system"
     backend.default_model = "mock"
