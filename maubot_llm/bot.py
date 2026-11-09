@@ -6,7 +6,7 @@ from typing import Any
 from maubot import MessageEvent, Plugin
 from maubot.handlers import command, event
 from mautrix.errors import MatrixError
-from mautrix.types import EventType
+from mautrix.types import EventType, MessageType
 from mautrix.util.async_db import UpgradeTable
 from mautrix.util.config import BaseProxyConfig, ConfigUpdateHelper
 
@@ -356,7 +356,10 @@ class LlmBot(Plugin):
         if not isinstance(body, str) or not body.strip():
             self.log.debug("Ignoring empty or non-text message")
             return
-        if getattr(content, "msgtype", None) not in {"m.text", "m.notice"}:
+        if getattr(content, "msgtype", None) not in {
+            MessageType.TEXT,
+            MessageType.NOTICE,
+        }:
             self.log.debug("Ignoring unsupported message type")
             return
         if self._is_edit(evt):

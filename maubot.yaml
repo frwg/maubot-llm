@@ -1,6 +1,6 @@
 maubot: 0.6.0
 id: net.brokensandals.llm
-version: 2.0.1
+version: 2.0.2
 license: MIT
 modules:
   - maubot_llm

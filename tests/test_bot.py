@@ -4,7 +4,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
-from mautrix.types import EventType
+from mautrix.types import EventType, MessageType
 from ruamel.yaml import YAML
 
 from maubot_llm.backends import ChatCompletion
@@ -161,14 +161,14 @@ async def test_message_filters_and_duplicate_event():
         )
 
     own_message = message(
-        bot.client.mxid, Content({"body": "loop", "msgtype": "m.text"})
+        bot.client.mxid, Content({"body": "loop", "msgtype": MessageType.TEXT})
     )
     edited_message = message(
         "@alice:example.org",
         Content(
             {
                 "body": "edited",
-                "msgtype": "m.text",
+                "msgtype": MessageType.TEXT,
                 "m.relates_to": {"rel_type": "m.replace"},
             }
         ),
@@ -186,7 +186,7 @@ async def test_message_filters_and_duplicate_event():
         Content(
             {
                 "body": "Hello @llm:example.org",
-                "msgtype": "m.text",
+                "msgtype": MessageType.TEXT,
                 "m.mentions": {"user_ids": ["@llm:example.org"]},
             }
         ),
@@ -198,6 +198,19 @@ async def test_message_filters_and_duplicate_event():
         claim.assert_awaited_once_with(bot.database, evt.event_id)
     evt.mark_read.assert_not_awaited()
     assert not bot._tasks
+
+    bot.config["group_mode"] = "all"
+    bot._is_mentioned = Mock(return_value=False)
+    all_mode_event = message(
+        "@alice:example.org",
+        Content({"body": "Hello", "msgtype": MessageType.TEXT}),
+    )
+    all_mode_event.event_id = "$all-mode-event"
+    with patch(
+        "maubot_llm.bot.db.claim_event", new_callable=AsyncMock, return_value=False
+    ) as claim:
+        await bot.handle_msg(all_mode_event)
+        claim.assert_awaited_once_with(bot.database, all_mode_event.event_id)
 
 
 @pytest.mark.asyncio
